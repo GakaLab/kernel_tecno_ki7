@@ -324,7 +324,7 @@ static int __stmmac_test_loopback(struct stmmac_priv *priv,
 	struct sk_buff *skb = NULL;
 	int ret = 0;
 
-	tpriv = kzalloc(sizeof(*tpriv), GFP_KERNEL);
+	tpriv = kzalloc_obj(*tpriv);
 	if (!tpriv)
 		return -ENOMEM;
 
@@ -382,14 +382,14 @@ static int stmmac_test_phy_loopback(struct stmmac_priv *priv)
 	if (!priv->dev->phydev)
 		return -EOPNOTSUPP;
 
-	ret = phy_loopback(priv->dev->phydev, true);
+	ret = phy_loopback(priv->dev->phydev, true, 0);
 	if (ret)
 		return ret;
 
 	attr.dst = priv->dev->dev_addr;
 	ret = __stmmac_test_loopback(priv, &attr);
 
-	phy_loopback(priv->dev->phydev, false);
+	phy_loopback(priv->dev->phydev, false, 0);
 	return ret;
 }
 
@@ -415,11 +415,17 @@ static int stmmac_test_mmc(struct stmmac_priv *priv)
 	stmmac_mmc_read(priv, priv->mmcaddr, &final);
 
 	/*
-	 * The number of MMC counters available depends on HW configuration
-	 * so we just use this one to validate the feature. I hope there is
-	 * not a version without this counter.
+	 * The number of MMC counters available depends on HW configuration,
+	 * and there doesn't seem to be a way to enumerate the implemented
+	 * counters.
+	 *
+	 * Let's check a hand-picked set of counters, knowing that :
+	 *  - Starfive JH7110 doesn't implement mmc_tx_framecount_g
+	 *  - Amlogic SM1 doesn't implement any mmc_tx_*
+	 *
 	 */
-	if (final.mmc_tx_framecount_g <= initial.mmc_tx_framecount_g)
+	if (final.mmc_tx_framecount_g <= initial.mmc_tx_framecount_g &&
+	    final.mmc_rx_framecount_gb <= initial.mmc_rx_framecount_gb)
 		return -EINVAL;
 
 	return 0;
@@ -434,11 +440,11 @@ static int stmmac_test_eee(struct stmmac_priv *priv)
 	if (!priv->dma_cap.eee || !priv->eee_active)
 		return -EOPNOTSUPP;
 
-	initial = kzalloc(sizeof(*initial), GFP_KERNEL);
+	initial = kzalloc_obj(*initial);
 	if (!initial)
 		return -ENOMEM;
 
-	final = kzalloc(sizeof(*final), GFP_KERNEL);
+	final = kzalloc_obj(*final);
 	if (!final) {
 		ret = -ENOMEM;
 		goto out_free_initial;
@@ -491,6 +497,21 @@ static int stmmac_filter_check(struct stmmac_priv *priv)
 
 	netdev_warn(priv->dev, "Test can't be run in promiscuous mode!\n");
 	return -EOPNOTSUPP;
+}
+
+static int stmmac_uc_filter_check(struct stmmac_priv *priv)
+{
+	/* For tests involving the UC filter, we need at least one empty
+	 * slot in the UC filter. The UC filters contains netdev_uc_count() + 1
+	 * entries: The dev->uc list + one entry for the HW address.
+	 *
+	 * Having an empty slot therefore means netdev_uc_count() + 2 entries
+	 * can fit in the filter
+	 */
+	if (netdev_uc_count(priv->dev) + 2 > priv->hw->unicast_filter_entries)
+		return -EOPNOTSUPP;
+
+	return 0;
 }
 
 static bool stmmac_hash_check(struct stmmac_priv *priv, unsigned char *addr)
@@ -584,7 +605,7 @@ static int stmmac_test_pfilt(struct stmmac_priv *priv)
 
 	if (stmmac_filter_check(priv))
 		return -EOPNOTSUPP;
-	if (netdev_uc_count(priv->dev) >= priv->hw->unicast_filter_entries)
+	if (stmmac_uc_filter_check(priv))
 		return -EOPNOTSUPP;
 
 	while (--tries) {
@@ -628,7 +649,7 @@ static int stmmac_test_mcfilt(struct stmmac_priv *priv)
 
 	if (stmmac_filter_check(priv))
 		return -EOPNOTSUPP;
-	if (netdev_uc_count(priv->dev) >= priv->hw->unicast_filter_entries)
+	if (stmmac_uc_filter_check(priv))
 		return -EOPNOTSUPP;
 	if (netdev_mc_count(priv->dev) >= priv->hw->multicast_filter_bins)
 		return -EOPNOTSUPP;
@@ -674,7 +695,7 @@ static int stmmac_test_ucfilt(struct stmmac_priv *priv)
 
 	if (stmmac_filter_check(priv))
 		return -EOPNOTSUPP;
-	if (netdev_uc_count(priv->dev) >= priv->hw->unicast_filter_entries)
+	if (stmmac_uc_filter_check(priv))
 		return -EOPNOTSUPP;
 	if (netdev_mc_count(priv->dev) >= priv->hw->multicast_filter_bins)
 		return -EOPNOTSUPP;
@@ -738,13 +759,25 @@ static int stmmac_test_flowctrl(struct stmmac_priv *priv)
 	struct phy_device *phydev = priv->dev->phydev;
 	u32 rx_cnt = priv->plat->rx_queues_to_use;
 	struct stmmac_test_priv *tpriv;
+	unsigned int rx_fifo_size;
 	unsigned int pkt_count;
 	int i, ret = 0;
 
 	if (!phydev || (!phydev->pause && !phydev->asym_pause))
 		return -EOPNOTSUPP;
 
-	tpriv = kzalloc(sizeof(*tpriv), GFP_KERNEL);
+	rx_fifo_size = priv->plat->rx_fifo_size;
+	if (!rx_fifo_size)
+		rx_fifo_size = priv->dma_cap.rx_fifo_size;
+
+	/* No pause frame is emitted if we don't have at least 4096 bytes per
+	 * queue, except on dwmac100.
+	 */
+	if (priv->plat->core_type != DWMAC_CORE_MAC100 &&
+	    rx_fifo_size / priv->plat->rx_queues_to_use < 4096)
+		return -EOPNOTSUPP;
+
+	tpriv = kzalloc_obj(*tpriv);
 	if (!tpriv)
 		return -ENOMEM;
 
@@ -757,9 +790,7 @@ static int stmmac_test_flowctrl(struct stmmac_priv *priv)
 	dev_add_pack(&tpriv->pt);
 
 	/* Compute minimum number of packets to make FIFO full */
-	pkt_count = priv->plat->rx_fifo_size;
-	if (!pkt_count)
-		pkt_count = priv->dma_cap.rx_fifo_size;
+	pkt_count = rx_fifo_size;
 	pkt_count /= 1400;
 	pkt_count *= 2;
 
@@ -802,7 +833,7 @@ static int stmmac_test_flowctrl(struct stmmac_priv *priv)
 		stmmac_start_rx(priv, priv->ioaddr, i);
 
 		local_bh_disable();
-		napi_reschedule(&ch->rx_napi);
+		napi_schedule(&ch->rx_napi);
 		local_bh_enable();
 	}
 
@@ -898,7 +929,7 @@ static int __stmmac_test_vlanfilt(struct stmmac_priv *priv)
 	struct sk_buff *skb = NULL;
 	int ret = 0, i;
 
-	tpriv = kzalloc(sizeof(*tpriv), GFP_KERNEL);
+	tpriv = kzalloc_obj(*tpriv);
 	if (!tpriv)
 		return -ENOMEM;
 
@@ -991,7 +1022,7 @@ static int __stmmac_test_dvlanfilt(struct stmmac_priv *priv)
 	struct sk_buff *skb = NULL;
 	int ret = 0, i;
 
-	tpriv = kzalloc(sizeof(*tpriv), GFP_KERNEL);
+	tpriv = kzalloc_obj(*tpriv);
 	if (!tpriv)
 		return -ENOMEM;
 
@@ -1095,23 +1126,23 @@ static int stmmac_test_rxp(struct stmmac_priv *priv)
 	if (!priv->dma_cap.frpsel)
 		return -EOPNOTSUPP;
 
-	sel = kzalloc(struct_size(sel, keys, nk), GFP_KERNEL);
+	sel = kzalloc_flex(*sel, keys, nk);
 	if (!sel)
 		return -ENOMEM;
 
-	exts = kzalloc(sizeof(*exts), GFP_KERNEL);
+	exts = kzalloc_obj(*exts);
 	if (!exts) {
 		ret = -ENOMEM;
 		goto cleanup_sel;
 	}
 
-	actions = kcalloc(nk, sizeof(*actions), GFP_KERNEL);
+	actions = kzalloc_objs(*actions, nk);
 	if (!actions) {
 		ret = -ENOMEM;
 		goto cleanup_exts;
 	}
 
-	gact = kcalloc(nk, sizeof(*gact), GFP_KERNEL);
+	gact = kzalloc_objs(*gact, nk);
 	if (!gact) {
 		ret = -ENOMEM;
 		goto cleanup_actions;
@@ -1266,7 +1297,7 @@ static int stmmac_test_vlanoff_common(struct stmmac_priv *priv, bool svlan)
 	if (!priv->dma_cap.vlins)
 		return -EOPNOTSUPP;
 
-	tpriv = kzalloc(sizeof(*tpriv), GFP_KERNEL);
+	tpriv = kzalloc_obj(*tpriv);
 	if (!tpriv)
 		return -ENOMEM;
 
@@ -1349,7 +1380,7 @@ static int __stmmac_test_l3filt(struct stmmac_priv *priv, u32 dst, u32 src,
 				     priv->plat->rx_queues_to_use);
 	}
 
-	dissector = kzalloc(sizeof(*dissector), GFP_KERNEL);
+	dissector = kzalloc_obj(*dissector);
 	if (!dissector) {
 		ret = -ENOMEM;
 		goto cleanup_rss;
@@ -1358,7 +1389,7 @@ static int __stmmac_test_l3filt(struct stmmac_priv *priv, u32 dst, u32 src,
 	dissector->used_keys |= (1ULL << FLOW_DISSECTOR_KEY_IPV4_ADDRS);
 	dissector->offset[FLOW_DISSECTOR_KEY_IPV4_ADDRS] = 0;
 
-	cls = kzalloc(sizeof(*cls), GFP_KERNEL);
+	cls = kzalloc_obj(*cls);
 	if (!cls) {
 		ret = -ENOMEM;
 		goto cleanup_dissector;
@@ -1368,7 +1399,7 @@ static int __stmmac_test_l3filt(struct stmmac_priv *priv, u32 dst, u32 src,
 	cls->command = FLOW_CLS_REPLACE;
 	cls->cookie = dummy_cookie;
 
-	rule = kzalloc(struct_size(rule, action.entries, 1), GFP_KERNEL);
+	rule = kzalloc_flex(*rule, action.entries, 1);
 	if (!rule) {
 		ret = -ENOMEM;
 		goto cleanup_cls;
@@ -1452,11 +1483,11 @@ static int __stmmac_test_l4filt(struct stmmac_priv *priv, u32 dst, u32 src,
 	struct {
 		struct flow_dissector_key_basic bkey;
 		struct flow_dissector_key_ports key;
-	} __aligned(BITS_PER_LONG / 8) keys;
+	} __aligned(BITS_PER_LONG / 8) keys = { };
 	struct {
 		struct flow_dissector_key_basic bmask;
 		struct flow_dissector_key_ports mask;
-	} __aligned(BITS_PER_LONG / 8) masks;
+	} __aligned(BITS_PER_LONG / 8) masks = { };
 	unsigned long dummy_cookie = 0xdeadbeef;
 	struct stmmac_packet_attrs attr = { };
 	struct flow_dissector *dissector;
@@ -1475,7 +1506,7 @@ static int __stmmac_test_l4filt(struct stmmac_priv *priv, u32 dst, u32 src,
 				     priv->plat->rx_queues_to_use);
 	}
 
-	dissector = kzalloc(sizeof(*dissector), GFP_KERNEL);
+	dissector = kzalloc_obj(*dissector);
 	if (!dissector) {
 		ret = -ENOMEM;
 		goto cleanup_rss;
@@ -1486,7 +1517,7 @@ static int __stmmac_test_l4filt(struct stmmac_priv *priv, u32 dst, u32 src,
 	dissector->offset[FLOW_DISSECTOR_KEY_BASIC] = 0;
 	dissector->offset[FLOW_DISSECTOR_KEY_PORTS] = offsetof(typeof(keys), key);
 
-	cls = kzalloc(sizeof(*cls), GFP_KERNEL);
+	cls = kzalloc_obj(*cls);
 	if (!cls) {
 		ret = -ENOMEM;
 		goto cleanup_dissector;
@@ -1496,7 +1527,7 @@ static int __stmmac_test_l4filt(struct stmmac_priv *priv, u32 dst, u32 src,
 	cls->command = FLOW_CLS_REPLACE;
 	cls->cookie = dummy_cookie;
 
-	rule = kzalloc(struct_size(rule, action.entries, 1), GFP_KERNEL);
+	rule = kzalloc_flex(*rule, action.entries, 1);
 	if (!rule) {
 		ret = -ENOMEM;
 		goto cleanup_cls;
@@ -1509,6 +1540,8 @@ static int __stmmac_test_l4filt(struct stmmac_priv *priv, u32 dst, u32 src,
 	keys.bkey.ip_proto = udp ? IPPROTO_UDP : IPPROTO_TCP;
 	keys.key.src = htons(src);
 	keys.key.dst = htons(dst);
+	/* Match the full IP proto field */
+	masks.bmask.ip_proto = 0xff;
 	masks.mask.src = src_mask;
 	masks.mask.dst = dst_mask;
 
@@ -1628,7 +1661,7 @@ static int stmmac_test_arpoffload(struct stmmac_priv *priv)
 	if (!priv->dma_cap.arpoffsel)
 		return -EOPNOTSUPP;
 
-	tpriv = kzalloc(sizeof(*tpriv), GFP_KERNEL);
+	tpriv = kzalloc_obj(*tpriv);
 	if (!tpriv)
 		return -ENOMEM;
 
@@ -1721,7 +1754,7 @@ static int stmmac_test_sph(struct stmmac_priv *priv)
 	struct stmmac_packet_attrs attr = { };
 	int ret;
 
-	if (!priv->sph)
+	if (!priv->sph_active)
 		return -EOPNOTSUPP;
 
 	/* Check for UDP first */
@@ -1985,7 +2018,7 @@ void stmmac_selftest_run(struct net_device *dev,
 		case STMMAC_LOOPBACK_PHY:
 			ret = -EOPNOTSUPP;
 			if (dev->phydev)
-				ret = phy_loopback(dev->phydev, true);
+				ret = phy_loopback(dev->phydev, true, 0);
 			if (!ret)
 				break;
 			fallthrough;
@@ -2000,7 +2033,7 @@ void stmmac_selftest_run(struct net_device *dev,
 		}
 
 		/*
-		 * First tests will always be MAC / PHY loobpack. If any of
+		 * First tests will always be MAC / PHY loopback. If any of
 		 * them is not supported we abort earlier.
 		 */
 		if (ret) {
@@ -2018,7 +2051,7 @@ void stmmac_selftest_run(struct net_device *dev,
 		case STMMAC_LOOPBACK_PHY:
 			ret = -EOPNOTSUPP;
 			if (dev->phydev)
-				ret = phy_loopback(dev->phydev, false);
+				ret = phy_loopback(dev->phydev, false, 0);
 			if (!ret)
 				break;
 			fallthrough;

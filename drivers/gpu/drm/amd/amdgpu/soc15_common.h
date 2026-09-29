@@ -69,7 +69,7 @@
 
 #define RREG32_SOC15_IP(ip, reg) __RREG32_SOC15_RLC__(reg, 0, ip##_HWIP, 0)
 
-#define RREG32_SOC15_IP_NO_KIQ(ip, reg) __RREG32_SOC15_RLC__(reg, AMDGPU_REGS_NO_KIQ, ip##_HWIP, 0)
+#define RREG32_SOC15_IP_NO_KIQ(ip, reg, inst) __RREG32_SOC15_RLC__(reg, AMDGPU_REGS_NO_KIQ, ip##_HWIP, inst)
 
 #define RREG32_SOC15_NO_KIQ(ip, inst, reg) \
 	__RREG32_SOC15_RLC__(adev->reg_offset[ip##_HWIP][inst][reg##_BASE_IDX] + reg, \
@@ -86,8 +86,8 @@
 #define WREG32_SOC15_IP(ip, reg, value) \
 	 __WREG32_SOC15_RLC__(reg, value, 0, ip##_HWIP, 0)
 
-#define WREG32_SOC15_IP_NO_KIQ(ip, reg, value) \
-	 __WREG32_SOC15_RLC__(reg, value, AMDGPU_REGS_NO_KIQ, ip##_HWIP, 0)
+#define WREG32_SOC15_IP_NO_KIQ(ip, reg, value, inst) \
+	 __WREG32_SOC15_RLC__(reg, value, AMDGPU_REGS_NO_KIQ, ip##_HWIP, inst)
 
 #define WREG32_SOC15_NO_KIQ(ip, inst, reg, value) \
 	__WREG32_SOC15_RLC__(adev->reg_offset[ip##_HWIP][inst][reg##_BASE_IDX] + reg, \
@@ -140,7 +140,7 @@
 
 /* for GC only */
 #define RREG32_RLC(reg) \
-	__RREG32_SOC15_RLC__(reg, AMDGPU_REGS_RLC, GC_HWIP)
+	__RREG32_SOC15_RLC__(reg, AMDGPU_REGS_RLC, GC_HWIP, 0)
 
 #define WREG32_RLC_NO_KIQ(reg, value, hwip) \
 	__WREG32_SOC15_RLC__(reg, value, AMDGPU_REGS_NO_KIQ | AMDGPU_REGS_RLC, hwip, 0)
@@ -195,13 +195,22 @@
 	__RREG32_SOC15_RLC__((adev->reg_offset[ip##_HWIP][inst][reg##_BASE_IDX] + reg) + offset, AMDGPU_REGS_RLC, ip##_HWIP, inst)
 
 /* inst equals to ext for some IPs */
-#define RREG32_SOC15_EXT(ip, inst, reg, ext) \
-	RREG32_PCIE_EXT((adev->reg_offset[ip##_HWIP][inst][reg##_BASE_IDX] + reg) * 4 \
-			+ adev->asic_funcs->encode_ext_smn_addressing(ext)) \
+#define RREG32_SOC15_EXT(ip, inst, reg, ext)                                 \
+	RREG32_PCIE_EXT((adev->reg_offset[ip##_HWIP][inst][reg##_BASE_IDX] + \
+			 reg) * 4 +                                          \
+			amdgpu_reg_get_smn_base64(adev, ip##_HWIP, inst))
 
-#define WREG32_SOC15_EXT(ip, inst, reg, ext, value) \
-	WREG32_PCIE_EXT((adev->reg_offset[ip##_HWIP][inst][reg##_BASE_IDX] + reg) * 4 \
-			+ adev->asic_funcs->encode_ext_smn_addressing(ext), \
-			value) \
+#define WREG32_SOC15_EXT(ip, inst, reg, ext, value)                         \
+	WREG32_PCIE_EXT(                                                    \
+		(adev->reg_offset[ip##_HWIP][inst][reg##_BASE_IDX] + reg) * \
+				4 +                                         \
+			amdgpu_reg_get_smn_base64(adev, ip##_HWIP, inst),   \
+		value)
+
+#define RREG64_MCA(smn_base, mca_base, idx) \
+	RREG64_PCIE_EXT(smn_base + mca_base + (idx * 8))
+
+#define WREG64_MCA(smn_base, mca_base, idx, val) \
+	WREG64_PCIE_EXT(smn_base + mca_base + (idx * 8), val)
 
 #endif

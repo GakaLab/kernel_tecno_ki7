@@ -9,7 +9,6 @@
  */
 
 #include <linux/kernel.h>
-#include <linux/mod_devicetable.h>
 #include <linux/module.h>
 #include <linux/pm.h>
 #include <linux/device.h>
@@ -96,7 +95,7 @@ MODULE_DEVICE_TABLE(acpi, ahci_acpi_match);
 
 static struct platform_driver ahci_driver = {
 	.probe = ahci_probe,
-	.remove_new = ata_platform_remove_one,
+	.remove = ata_platform_remove_one,
 	.shutdown = ahci_platform_shutdown,
 	.driver = {
 		.name = DRV_NAME,

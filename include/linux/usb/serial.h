@@ -13,6 +13,7 @@
 #include <linux/mutex.h>
 #include <linux/serial.h>
 #include <linux/kfifo.h>
+#include <linux/usb.h>
 
 /* The maximum number of ports one device can grab at once */
 #define MAX_NUM_PORTS		16
@@ -311,8 +312,11 @@ struct usb_serial_driver {
 #define to_usb_serial_driver(d) \
 	container_of(d, struct usb_serial_driver, driver)
 
-int usb_serial_register_drivers(struct usb_serial_driver *const serial_drivers[],
-		const char *name, const struct usb_device_id *id_table);
+#define usb_serial_register_drivers(serial_drivers, name, id_table) \
+	__usb_serial_register_drivers(serial_drivers, THIS_MODULE, name, id_table)
+int __usb_serial_register_drivers(struct usb_serial_driver *const serial_drivers[],
+				  struct module *owner, const char *name,
+				  const struct usb_device_id *id_table);
 void usb_serial_deregister_drivers(struct usb_serial_driver *const serial_drivers[]);
 void usb_serial_port_softint(struct usb_serial_port *port);
 

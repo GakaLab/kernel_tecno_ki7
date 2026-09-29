@@ -99,7 +99,7 @@
 #include <linux/delay.h>
 #include <linux/i2c.h>
 #include <linux/slab.h>
-#include <linux/of_device.h>
+#include <linux/of.h>
 #include <linux/of_graph.h>
 #include <linux/module.h>
 #include <linux/regmap.h>
@@ -303,7 +303,7 @@ static const struct of_device_id ak4613_of_match[] = {
 MODULE_DEVICE_TABLE(of, ak4613_of_match);
 
 static const struct i2c_device_id ak4613_i2c_id[] = {
-	{ "ak4613", (kernel_ulong_t)&ak4613_regmap_cfg },
+	{ .name = "ak4613", .driver_data = (kernel_ulong_t)&ak4613_regmap_cfg },
 	{ }
 };
 MODULE_DEVICE_TABLE(i2c, ak4613_i2c_id);
@@ -748,12 +748,7 @@ static int ak4613_dai_trigger(struct snd_pcm_substream *substream, int cmd,
 	return 0;
 }
 
-/*
- * Select below from Sound Card, not Auto
- *	SND_SOC_DAIFMT_CBC_CFC
- *	SND_SOC_DAIFMT_CBP_CFP
- */
-static u64 ak4613_dai_formats =
+static const u64 ak4613_dai_formats =
 	SND_SOC_POSSIBLE_DAIFMT_I2S	|
 	SND_SOC_POSSIBLE_DAIFMT_LEFT_J;
 
@@ -840,14 +835,14 @@ static void ak4613_parse_of(struct ak4613_priv *priv,
 	/* Input 1 - 2 */
 	for (i = 0; i < 2; i++) {
 		snprintf(prop, sizeof(prop), "asahi-kasei,in%d-single-end", i + 1);
-		if (!of_get_property(np, prop, NULL))
+		if (!of_property_read_bool(np, prop))
 			priv->ic |= 1 << i;
 	}
 
 	/* Output 1 - 6 */
 	for (i = 0; i < 6; i++) {
 		snprintf(prop, sizeof(prop), "asahi-kasei,out%d-single-end", i + 1);
-		if (!of_get_property(np, prop, NULL))
+		if (!of_property_read_bool(np, prop))
 			priv->oc |= 1 << i;
 	}
 

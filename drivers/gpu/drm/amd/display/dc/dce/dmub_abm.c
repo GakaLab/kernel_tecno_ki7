@@ -28,6 +28,8 @@
 #include "dc.h"
 #include "core_types.h"
 #include "dmub_cmd.h"
+#include "dc_dmub_srv.h"
+#include "dmub/dmub_srv.h"
 
 #define TO_DMUB_ABM(abm)\
 	container_of(abm, struct dce_abm, base)
@@ -39,8 +41,7 @@ static unsigned int abm_feature_support(struct abm *abm, unsigned int panel_inst
 {
 	struct dc_context *dc = abm->ctx;
 	struct dc_link *edp_links[MAX_NUM_EDP];
-	int i;
-	int edp_num;
+	unsigned int i, edp_num;
 	unsigned int ret = ABM_FEATURE_NO_SUPPORT;
 
 	dc_get_edp_links(dc->dc, edp_links, &edp_num);
@@ -57,18 +58,22 @@ static unsigned int abm_feature_support(struct abm *abm, unsigned int panel_inst
 	return ret;
 }
 
-static void dmub_abm_init_ex(struct abm *abm, uint32_t backlight)
+static void dmub_abm_init_ex(struct abm *abm, uint32_t backlight, uint32_t user_level)
 {
-	dmub_abm_init(abm, backlight);
+	dmub_abm_init(abm, backlight, user_level);
 }
 
 static unsigned int dmub_abm_get_current_backlight_ex(struct abm *abm)
 {
+	dc_allow_idle_optimizations(abm->ctx->dc, false);
+
 	return dmub_abm_get_current_backlight(abm);
 }
 
 static unsigned int dmub_abm_get_target_backlight_ex(struct abm *abm)
 {
+	dc_allow_idle_optimizations(abm->ctx->dc, false);
+
 	return dmub_abm_get_target_backlight(abm);
 }
 
@@ -145,7 +150,11 @@ static bool dmub_abm_save_restore_ex(
 	return ret;
 }
 
-static bool dmub_abm_set_pipe_ex(struct abm *abm, uint32_t otg_inst, uint32_t option, uint32_t panel_inst)
+static bool dmub_abm_set_pipe_ex(struct abm *abm,
+		uint32_t otg_inst,
+		uint32_t option,
+		uint32_t panel_inst,
+		uint32_t pwrseq_inst)
 {
 	bool ret = false;
 	unsigned int feature_support;
@@ -153,7 +162,7 @@ static bool dmub_abm_set_pipe_ex(struct abm *abm, uint32_t otg_inst, uint32_t op
 	feature_support = abm_feature_support(abm, panel_inst);
 
 	if (feature_support == ABM_LCD_SUPPORT)
-		ret = dmub_abm_set_pipe(abm, otg_inst, option, panel_inst);
+		ret = dmub_abm_set_pipe(abm, otg_inst, option, panel_inst, pwrseq_inst);
 
 	return ret;
 }
@@ -164,6 +173,7 @@ static bool dmub_abm_set_backlight_level_pwm_ex(struct abm *abm,
 		unsigned int controller_id,
 		unsigned int panel_inst)
 {
+	(void)controller_id;
 	bool ret = false;
 	unsigned int feature_support;
 
@@ -212,7 +222,7 @@ struct abm *dmub_abm_create(
 	const struct dce_abm_mask *abm_mask)
 {
 	if (ctx->dc->caps.dmcub_support) {
-		struct dce_abm *abm_dce = kzalloc(sizeof(*abm_dce), GFP_KERNEL);
+		struct dce_abm *abm_dce = kzalloc_obj(*abm_dce);
 
 		if (abm_dce == NULL) {
 			BREAK_TO_DEBUGGER();

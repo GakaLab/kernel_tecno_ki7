@@ -223,7 +223,7 @@ emac_alloc_dma_req(struct emac_board_info *db,
 {
 	struct emac_dma_req *req;
 
-	req = kzalloc(sizeof(struct emac_dma_req), GFP_ATOMIC);
+	req = kzalloc_obj(struct emac_dma_req, GFP_ATOMIC);
 	if (!req)
 		return NULL;
 
@@ -996,9 +996,9 @@ static int emac_probe(struct platform_device *pdev)
 	/* fill in parameters for net-dev structure */
 	ndev->base_addr = (unsigned long)db->membase;
 	ndev->irq = irq_of_parse_and_map(np, 0);
-	if (ndev->irq == -ENXIO) {
+	if (!ndev->irq) {
 		netdev_err(ndev, "No irq resource\n");
-		ret = ndev->irq;
+		ret = -ENXIO;
 		goto out_iounmap;
 	}
 
@@ -1067,6 +1067,7 @@ static int emac_probe(struct platform_device *pdev)
 	return 0;
 
 out_release_sram:
+	of_node_put(db->phy_node);
 	sunxi_sram_release(&pdev->dev);
 out_clk_disable_unprepare:
 	clk_disable_unprepare(db->clk);
@@ -1083,7 +1084,7 @@ out:
 	return ret;
 }
 
-static int emac_remove(struct platform_device *pdev)
+static void emac_remove(struct platform_device *pdev)
 {
 	struct net_device *ndev = platform_get_drvdata(pdev);
 	struct emac_board_info *db = netdev_priv(ndev);
@@ -1094,6 +1095,7 @@ static int emac_remove(struct platform_device *pdev)
 	}
 
 	unregister_netdev(ndev);
+	of_node_put(db->phy_node);
 	sunxi_sram_release(&pdev->dev);
 	clk_disable_unprepare(db->clk);
 	irq_dispose_mapping(ndev->irq);
@@ -1101,7 +1103,6 @@ static int emac_remove(struct platform_device *pdev)
 	free_netdev(ndev);
 
 	dev_dbg(&pdev->dev, "released and freed device\n");
-	return 0;
 }
 
 static int emac_suspend(struct platform_device *dev, pm_message_t state)

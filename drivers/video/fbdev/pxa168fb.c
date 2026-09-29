@@ -653,10 +653,9 @@ static int pxa168fb_probe(struct platform_device *pdev)
 	/*
 	 * Map LCD controller registers.
 	 */
-	fbi->reg_base = devm_ioremap(&pdev->dev, res->start,
-					     resource_size(res));
-	if (fbi->reg_base == NULL) {
-		ret = -ENOMEM;
+	fbi->reg_base = devm_ioremap_resource(&pdev->dev, res);
+	if (IS_ERR(fbi->reg_base)) {
+		ret = PTR_ERR(fbi->reg_base);
 		goto failed_free_info;
 	}
 
@@ -799,7 +798,7 @@ static struct platform_driver pxa168fb_driver = {
 		.name	= "pxa168-fb",
 	},
 	.probe		= pxa168fb_probe,
-	.remove_new	= pxa168fb_remove,
+	.remove		= pxa168fb_remove,
 };
 
 module_platform_driver(pxa168fb_driver);

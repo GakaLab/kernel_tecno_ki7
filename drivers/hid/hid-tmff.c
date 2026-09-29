@@ -17,6 +17,7 @@
 
 #include <linux/hid.h>
 #include <linux/input.h>
+#include <linux/math64.h>
 #include <linux/slab.h>
 #include <linux/module.h>
 
@@ -47,9 +48,9 @@ struct tmff_device {
 /* Changes values from 0 to 0xffff into values from minimum to maximum */
 static inline int tmff_scale_u16(unsigned int in, int minimum, int maximum)
 {
-	int ret;
+	s64 ret;
 
-	ret = (in * (maximum - minimum) / 0xffff) + minimum;
+	ret = div_s64((s64)in * ((s64)maximum - minimum), 0xffff) + minimum;
 	if (ret < minimum)
 		return minimum;
 	if (ret > maximum)
@@ -60,9 +61,9 @@ static inline int tmff_scale_u16(unsigned int in, int minimum, int maximum)
 /* Changes values from -0x80 to 0x7f into values from minimum to maximum */
 static inline int tmff_scale_s8(int in, int minimum, int maximum)
 {
-	int ret;
+	s64 ret;
 
-	ret = (((in + 0x80) * (maximum - minimum)) / 0xff) + minimum;
+	ret = div_s64((s64)(in + 0x80) * ((s64)maximum - minimum), 0xff) + minimum;
 	if (ret < minimum)
 		return minimum;
 	if (ret > maximum)
@@ -132,7 +133,7 @@ static int tmff_init(struct hid_device *hid, const signed short *ff_bits)
 	hidinput = list_entry(hid->inputs.next, struct hid_input, list);
 	input_dev = hidinput->input;
 
-	tmff = kzalloc(sizeof(struct tmff_device), GFP_KERNEL);
+	tmff = kzalloc_obj(struct tmff_device);
 	if (!tmff)
 		return -ENOMEM;
 
@@ -265,4 +266,5 @@ static struct hid_driver tm_driver = {
 };
 module_hid_driver(tm_driver);
 
+MODULE_DESCRIPTION("Force feedback support for various HID compliant devices by ThrustMaster");
 MODULE_LICENSE("GPL");

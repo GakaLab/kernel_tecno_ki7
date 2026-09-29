@@ -8,7 +8,6 @@
 #include <linux/delay.h>
 #include <linux/device.h>
 #include <linux/pm_runtime.h>
-#include <linux/mod_devicetable.h>
 #include <linux/module.h>
 #include <linux/regmap.h>
 #include <linux/dmi.h>
@@ -236,10 +235,10 @@ static const struct reg_default rt1318_reg_defaults[] = {
 	{ 0xf805, 0x00 },
 	{ 0xf806, 0x07 },
 	{ 0xf807, 0xff },
-	{ SDW_SDCA_CTL(FUNC_NUM_SMART_AMP, RT1318_SDCA_ENT_UDMPU21, RT1318_SDCA_CTL_UDMPU_CLUSTER, 0), 0x00 },
 	{ SDW_SDCA_CTL(FUNC_NUM_SMART_AMP, RT1318_SDCA_ENT_FU21, RT1318_SDCA_CTL_FU_MUTE, CH_L), 0x01 },
 	{ SDW_SDCA_CTL(FUNC_NUM_SMART_AMP, RT1318_SDCA_ENT_FU21, RT1318_SDCA_CTL_FU_MUTE, CH_R), 0x01 },
 	{ SDW_SDCA_CTL(FUNC_NUM_SMART_AMP, RT1318_SDCA_ENT_PDE23, RT1318_SDCA_CTL_REQ_POWER_STATE, 0), 0x03 },
+	{ SDW_SDCA_CTL(FUNC_NUM_SMART_AMP, RT1318_SDCA_ENT_UDMPU21, RT1318_SDCA_CTL_UDMPU_CLUSTER, 0), 0x00 },
 	{ SDW_SDCA_CTL(FUNC_NUM_SMART_AMP, RT1318_SDCA_ENT_CS21, RT1318_SDCA_CTL_SAMPLE_FREQ_INDEX, 0), 0x09 },
 };
 
@@ -434,7 +433,6 @@ static int rt1318_io_init(struct device *dev, struct sdw_slave *slave)
 	rt1318->first_hw_init = true;
 	rt1318->hw_init = true;
 
-	pm_runtime_mark_last_busy(&slave->dev);
 	pm_runtime_put_autosuspend(&slave->dev);
 
 	dev_dbg(&slave->dev, "%s hw_init complete\n", __func__);
@@ -606,7 +604,7 @@ static int rt1318_sdw_hw_params(struct snd_pcm_substream *substream,
 	retval = sdw_stream_add_slave(rt1318->sdw_slave, &stream_config,
 				&port_config, 1, sdw_stream);
 	if (retval) {
-		dev_err(dai->dev, "Unable to configure port\n");
+		dev_err(dai->dev, "%s: Unable to configure port\n", __func__);
 		return retval;
 	}
 
@@ -631,8 +629,8 @@ static int rt1318_sdw_hw_params(struct snd_pcm_substream *substream,
 		sampling_rate = RT1318_SDCA_RATE_192000HZ;
 		break;
 	default:
-		dev_err(component->dev, "Rate %d is not supported\n",
-			params_rate(params));
+		dev_err(component->dev, "%s: Rate %d is not supported\n",
+			__func__, params_rate(params));
 		return -EINVAL;
 	}
 
@@ -794,11 +792,9 @@ static int rt1318_sdw_probe(struct sdw_slave *slave,
 	return rt1318_sdw_init(&slave->dev, regmap, slave);
 }
 
-static int rt1318_sdw_remove(struct sdw_slave *slave)
+static void rt1318_sdw_remove(struct sdw_slave *slave)
 {
 	pm_runtime_disable(&slave->dev);
-
-	return 0;
 }
 
 static const struct sdw_device_id rt1318_id[] = {
@@ -807,7 +803,7 @@ static const struct sdw_device_id rt1318_id[] = {
 };
 MODULE_DEVICE_TABLE(sdw, rt1318_id);
 
-static int __maybe_unused rt1318_dev_suspend(struct device *dev)
+static int rt1318_dev_suspend(struct device *dev)
 {
 	struct rt1318_sdw_priv *rt1318 = dev_get_drvdata(dev);
 
@@ -820,27 +816,19 @@ static int __maybe_unused rt1318_dev_suspend(struct device *dev)
 
 #define RT1318_PROBE_TIMEOUT 5000
 
-static int __maybe_unused rt1318_dev_resume(struct device *dev)
+static int rt1318_dev_resume(struct device *dev)
 {
 	struct sdw_slave *slave = dev_to_sdw_dev(dev);
 	struct rt1318_sdw_priv *rt1318 = dev_get_drvdata(dev);
-	unsigned long time;
+	int ret;
 
 	if (!rt1318->first_hw_init)
 		return 0;
 
-	if (!slave->unattach_request)
-		goto regmap_sync;
+	ret = sdw_slave_wait_for_init(slave, RT1318_PROBE_TIMEOUT);
+	if (ret)
+		return ret;
 
-	time = wait_for_completion_timeout(&slave->initialization_complete,
-				msecs_to_jiffies(RT1318_PROBE_TIMEOUT));
-	if (!time) {
-		dev_err(&slave->dev, "Initialization not complete, timed out\n");
-		return -ETIMEDOUT;
-	}
-
-regmap_sync:
-	slave->unattach_request = 0;
 	regcache_cache_only(rt1318->regmap, false);
 	regcache_sync(rt1318->regmap);
 
@@ -848,15 +836,14 @@ regmap_sync:
 }
 
 static const struct dev_pm_ops rt1318_pm = {
-	SET_SYSTEM_SLEEP_PM_OPS(rt1318_dev_suspend, rt1318_dev_resume)
-	SET_RUNTIME_PM_OPS(rt1318_dev_suspend, rt1318_dev_resume, NULL)
+	SYSTEM_SLEEP_PM_OPS(rt1318_dev_suspend, rt1318_dev_resume)
+	RUNTIME_PM_OPS(rt1318_dev_suspend, rt1318_dev_resume, NULL)
 };
 
 static struct sdw_driver rt1318_sdw_driver = {
 	.driver = {
 		.name = "rt1318-sdca",
-		.owner = THIS_MODULE,
-		.pm = &rt1318_pm,
+		.pm = pm_ptr(&rt1318_pm),
 	},
 	.probe = rt1318_sdw_probe,
 	.remove = rt1318_sdw_remove,

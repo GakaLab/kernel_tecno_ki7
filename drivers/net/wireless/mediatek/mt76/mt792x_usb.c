@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: ISC
+// SPDX-License-Identifier: BSD-3-Clause-Clear
 /* Copyright (C) 2023 MediaTek Inc.
  *
  * Author: Lorenzo Bianconi <lorenzo@kernel.org>
@@ -10,6 +10,143 @@
 
 #include "mt792x.h"
 #include "mt76_connac2_mac.h"
+
+static int mt792xu_read32(struct mt76_dev *dev, u32 addr, void *buf)
+{
+	return __mt76u_vendor_request(dev, MT_VEND_READ_EXT,
+				      USB_DIR_IN | MT_USB_TYPE_VENDOR,
+				      (u16)(addr >> 16), (u16)addr,
+				      buf, sizeof(__le32));
+}
+
+static void mt792xu_reset_work(struct work_struct *work)
+{
+	struct mt792x_dev *dev =
+		container_of(work, struct mt792x_dev, usb_reset_work);
+	struct usb_interface *usb_intf = to_usb_interface(dev->mt76.dev);
+
+	if (usb_intf && usb_get_intfdata(usb_intf) == dev)
+		usb_queue_reset_device(usb_intf);
+
+	atomic_set(&dev->usb_reset_pending, 0);
+}
+
+static void mt792xu_queue_usb_reset(struct mt792x_dev *dev, int err)
+{
+	if (!atomic_xchg(&dev->usb_reset_pending, 1)) {
+		dev_warn(dev->mt76.dev,
+			 "USB transport access failed (%d), queueing device reset\n",
+			 err);
+
+		schedule_work(&dev->usb_reset_work);
+	}
+}
+
+static u32 mt792xu_bus_hung_rr(struct mt76_dev *mdev, u32 offset)
+{
+	return 0;
+}
+
+static void mt792xu_bus_hung_wr(struct mt76_dev *mdev, u32 offset, u32 val)
+{
+}
+
+static u32 mt792xu_bus_hung_rmw(struct mt76_dev *mdev, u32 offset,
+				u32 mask, u32 val)
+{
+	return 0;
+}
+
+static void mt792xu_bus_hung_write_copy(struct mt76_dev *mdev, u32 offset,
+					const void *data, int len)
+{
+}
+
+static void mt792xu_bus_hung_read_copy(struct mt76_dev *mdev, u32 offset,
+				       void *data, int len)
+{
+	memset(data, 0, len);
+}
+
+static const struct mt76_bus_ops mt792xu_bus_hung_ops = {
+	.rr = mt792xu_bus_hung_rr,
+	.wr = mt792xu_bus_hung_wr,
+	.rmw = mt792xu_bus_hung_rmw,
+	.write_copy = mt792xu_bus_hung_write_copy,
+	.read_copy = mt792xu_bus_hung_read_copy,
+	.type = MT76_BUS_USB,
+};
+
+static void mt792xu_set_bus_hung(struct mt792x_dev *dev)
+{
+	atomic_set(&dev->mt76.bus_hung, true);
+
+	if (READ_ONCE(dev->mt76.bus) == &mt792xu_bus_hung_ops)
+		return;
+
+	WRITE_ONCE(dev->mt76.bus, &mt792xu_bus_hung_ops);
+}
+
+static void mt792xu_ctrl_timeout(struct mt76_dev *mdev, int err)
+{
+	struct mt792x_dev *dev = container_of(mdev, struct mt792x_dev, mt76);
+
+	mt792xu_set_bus_hung(dev);
+	mt792xu_queue_usb_reset(dev, err);
+}
+
+void mt792xu_reset_work_init(struct mt792x_dev *dev)
+{
+	INIT_WORK(&dev->usb_reset_work, mt792xu_reset_work);
+	atomic_set(&dev->usb_reset_pending, 0);
+	dev->mt76.usb.ctrl_timeout = mt792xu_ctrl_timeout;
+}
+EXPORT_SYMBOL_GPL(mt792xu_reset_work_init);
+
+void mt792xu_reset_work_cleanup(struct mt792x_dev *dev)
+{
+	cancel_work_sync(&dev->usb_reset_work);
+	atomic_set(&dev->usb_reset_pending, 0);
+}
+EXPORT_SYMBOL_GPL(mt792xu_reset_work_cleanup);
+
+int mt792xu_check_bus(struct mt792x_dev *dev)
+{
+	int ret;
+
+	mutex_lock(&dev->mt76.usb.usb_ctrl_mtx);
+	ret = mt792xu_read32(&dev->mt76, MT_HW_CHIPID, dev->mt76.usb.data);
+	mutex_unlock(&dev->mt76.usb.usb_ctrl_mtx);
+
+	if (ret == sizeof(__le32))
+		return 0;
+
+	return ret < 0 ? ret : -EIO;
+}
+EXPORT_SYMBOL_GPL(mt792xu_check_bus);
+
+int mt792xu_reset_on_bus_error(struct mt792x_dev *dev)
+{
+	int err;
+
+	/* Once hung, the no-op bus ops stay installed until the queued USB
+	 * reset re-probes the device. Do not clear bus_hung here, or the caller
+	 * would run a full reset over dropped register I/O and report success.
+	 */
+	if (atomic_read(&dev->mt76.bus_hung))
+		return -EIO;
+
+	err = mt792xu_check_bus(dev);
+	if (err) {
+		mt792xu_set_bus_hung(dev);
+		mt792xu_queue_usb_reset(dev, err);
+
+		return err;
+	}
+
+	return 0;
+}
+EXPORT_SYMBOL_GPL(mt792xu_reset_on_bus_error);
 
 u32 mt792xu_rr(struct mt76_dev *dev, u32 addr)
 {
@@ -121,44 +258,25 @@ static void mt792xu_uhw_wr(struct mt76_dev *dev, u32 addr, u32 val)
 
 static void mt792xu_dma_prefetch(struct mt792x_dev *dev)
 {
-	mt76_rmw(dev, MT_UWFDMA0_TX_RING_EXT_CTRL(0),
-		 MT_WPDMA0_MAX_CNT_MASK, 4);
-	mt76_rmw(dev, MT_UWFDMA0_TX_RING_EXT_CTRL(0),
-		 MT_WPDMA0_BASE_PTR_MASK, 0x80);
+#define DMA_PREFETCH_CONF(_idx_, _cnt_, _base_) \
+	mt76_rmw(dev, MT_UWFDMA0_TX_RING_EXT_CTRL((_idx_)), \
+		 MT_WPDMA0_MAX_CNT_MASK | MT_WPDMA0_BASE_PTR_MASK, \
+		 FIELD_PREP(MT_WPDMA0_MAX_CNT_MASK, (_cnt_)) | \
+		 FIELD_PREP(MT_WPDMA0_BASE_PTR_MASK, (_base_)))
 
-	mt76_rmw(dev, MT_UWFDMA0_TX_RING_EXT_CTRL(1),
-		 MT_WPDMA0_MAX_CNT_MASK, 4);
-	mt76_rmw(dev, MT_UWFDMA0_TX_RING_EXT_CTRL(1),
-		 MT_WPDMA0_BASE_PTR_MASK, 0xc0);
-
-	mt76_rmw(dev, MT_UWFDMA0_TX_RING_EXT_CTRL(2),
-		 MT_WPDMA0_MAX_CNT_MASK, 4);
-	mt76_rmw(dev, MT_UWFDMA0_TX_RING_EXT_CTRL(2),
-		 MT_WPDMA0_BASE_PTR_MASK, 0x100);
-
-	mt76_rmw(dev, MT_UWFDMA0_TX_RING_EXT_CTRL(3),
-		 MT_WPDMA0_MAX_CNT_MASK, 4);
-	mt76_rmw(dev, MT_UWFDMA0_TX_RING_EXT_CTRL(3),
-		 MT_WPDMA0_BASE_PTR_MASK, 0x140);
-
-	mt76_rmw(dev, MT_UWFDMA0_TX_RING_EXT_CTRL(4),
-		 MT_WPDMA0_MAX_CNT_MASK, 4);
-	mt76_rmw(dev, MT_UWFDMA0_TX_RING_EXT_CTRL(4),
-		 MT_WPDMA0_BASE_PTR_MASK, 0x180);
-
-	mt76_rmw(dev, MT_UWFDMA0_TX_RING_EXT_CTRL(16),
-		 MT_WPDMA0_MAX_CNT_MASK, 4);
-	mt76_rmw(dev, MT_UWFDMA0_TX_RING_EXT_CTRL(16),
-		 MT_WPDMA0_BASE_PTR_MASK, 0x280);
-
-	mt76_rmw(dev, MT_UWFDMA0_TX_RING_EXT_CTRL(17),
-		 MT_WPDMA0_MAX_CNT_MASK, 4);
-	mt76_rmw(dev, MT_UWFDMA0_TX_RING_EXT_CTRL(17),
-		 MT_WPDMA0_BASE_PTR_MASK,  0x2c0);
+	DMA_PREFETCH_CONF(0, 4, 0x080);
+	DMA_PREFETCH_CONF(1, 4, 0x0c0);
+	DMA_PREFETCH_CONF(2, 4, 0x100);
+	DMA_PREFETCH_CONF(3, 4, 0x140);
+	DMA_PREFETCH_CONF(4, 4, 0x180);
+	DMA_PREFETCH_CONF(16, 4, 0x280);
+	DMA_PREFETCH_CONF(17, 4, 0x2c0);
 }
 
 static void mt792xu_wfdma_init(struct mt792x_dev *dev)
 {
+	int i;
+
 	mt792xu_dma_prefetch(dev);
 
 	mt76_clear(dev, MT_UWFDMA0_GLO_CFG, MT_WFDMA0_GLO_CFG_OMIT_RX_INFO);
@@ -169,10 +287,27 @@ static void mt792xu_wfdma_init(struct mt792x_dev *dev)
 		 MT_WFDMA0_GLO_CFG_TX_DMA_EN |
 		 MT_WFDMA0_GLO_CFG_RX_DMA_EN);
 
-	/* disable dmashdl */
-	mt76_clear(dev, MT_UWFDMA0_GLO_CFG_EXT0,
-		   MT_WFDMA0_CSR_TX_DMASHDL_ENABLE);
-	mt76_set(dev, MT_DMASHDL_SW_CONTROL, MT_DMASHDL_DMASHDL_BYPASS);
+	mt76_rmw(dev, MT_DMASHDL_REFILL, MT_DMASHDL_REFILL_MASK, 0xffe00000);
+	mt76_clear(dev, MT_DMASHDL_PAGE, MT_DMASHDL_GROUP_SEQ_ORDER);
+	mt76_rmw(dev, MT_DMASHDL_PKT_MAX_SIZE,
+		 MT_DMASHDL_PKT_MAX_SIZE_PLE | MT_DMASHDL_PKT_MAX_SIZE_PSE,
+		 FIELD_PREP(MT_DMASHDL_PKT_MAX_SIZE_PLE, 1) |
+		 FIELD_PREP(MT_DMASHDL_PKT_MAX_SIZE_PSE, 0));
+	for (i = 0; i < 5; i++)
+		mt76_wr(dev, MT_DMASHDL_GROUP_QUOTA(i),
+			FIELD_PREP(MT_DMASHDL_GROUP_QUOTA_MIN, 0x3) |
+			FIELD_PREP(MT_DMASHDL_GROUP_QUOTA_MAX, 0xfff));
+	for (i = 5; i < 16; i++)
+		mt76_wr(dev, MT_DMASHDL_GROUP_QUOTA(i),
+			FIELD_PREP(MT_DMASHDL_GROUP_QUOTA_MIN, 0x0) |
+			FIELD_PREP(MT_DMASHDL_GROUP_QUOTA_MAX, 0x0));
+	mt76_wr(dev, MT_DMASHDL_Q_MAP(0), 0x32013201);
+	mt76_wr(dev, MT_DMASHDL_Q_MAP(1), 0x32013201);
+	mt76_wr(dev, MT_DMASHDL_Q_MAP(2), 0x55555444);
+	mt76_wr(dev, MT_DMASHDL_Q_MAP(3), 0x55555444);
+
+	mt76_wr(dev, MT_DMASHDL_SCHED_SET(0), 0x76540132);
+	mt76_wr(dev, MT_DMASHDL_SCHED_SET(1), 0xFEDCBA98);
 
 	mt76_set(dev, MT_WFDMA_DUMMY_CR, MT_WFDMA_NEED_REINIT);
 }
@@ -208,6 +343,33 @@ static void mt792xu_epctl_rst_opt(struct mt792x_dev *dev, bool reset)
 	mt792xu_uhw_wr(&dev->mt76, MT_SSUSB_EPCTL_CSR_EP_RST_OPT, val);
 }
 
+struct mt792xu_wfsys_desc {
+	u32 rst_reg;
+	u32 done_reg;
+	u32 done_mask;
+	u32 done_val;
+	u32 delay_ms;
+	bool need_status_sel;
+};
+
+static const struct mt792xu_wfsys_desc mt7921_wfsys_desc = {
+	.rst_reg = MT_CBTOP_RGU_WF_SUBSYS_RST,
+	.done_reg = MT_UDMA_CONN_INFRA_STATUS,
+	.done_mask = MT_UDMA_CONN_WFSYS_INIT_DONE,
+	.done_val = MT_UDMA_CONN_WFSYS_INIT_DONE,
+	.delay_ms = 0,
+	.need_status_sel = true,
+};
+
+static const struct mt792xu_wfsys_desc mt7925_wfsys_desc = {
+	.rst_reg = MT7925_CBTOP_RGU_WF_SUBSYS_RST,
+	.done_reg = MT7925_WFSYS_INIT_DONE_ADDR,
+	.done_mask = U32_MAX,
+	.done_val = MT7925_WFSYS_INIT_DONE,
+	.delay_ms = 20,
+	.need_status_sel = false,
+};
+
 int mt792xu_dma_init(struct mt792x_dev *dev, bool resume)
 {
 	int err;
@@ -238,25 +400,36 @@ EXPORT_SYMBOL_GPL(mt792xu_dma_init);
 
 int mt792xu_wfsys_reset(struct mt792x_dev *dev)
 {
+	const struct mt792xu_wfsys_desc *desc = is_connac3(&dev->mt76) ?
+						&mt7925_wfsys_desc :
+						&mt7921_wfsys_desc;
 	u32 val;
 	int i;
 
+	if (atomic_read(&dev->mt76.bus_hung))
+		return -EIO;
+
 	mt792xu_epctl_rst_opt(dev, false);
 
-	val = mt792xu_uhw_rr(&dev->mt76, MT_CBTOP_RGU_WF_SUBSYS_RST);
+	val = mt792xu_uhw_rr(&dev->mt76, desc->rst_reg);
 	val |= MT_CBTOP_RGU_WF_SUBSYS_RST_WF_WHOLE_PATH;
-	mt792xu_uhw_wr(&dev->mt76, MT_CBTOP_RGU_WF_SUBSYS_RST, val);
+	mt792xu_uhw_wr(&dev->mt76, desc->rst_reg, val);
 
-	usleep_range(10, 20);
+	if (desc->delay_ms)
+		msleep(desc->delay_ms);
+	else
+		usleep_range(10, 20);
 
-	val = mt792xu_uhw_rr(&dev->mt76, MT_CBTOP_RGU_WF_SUBSYS_RST);
+	val = mt792xu_uhw_rr(&dev->mt76, desc->rst_reg);
 	val &= ~MT_CBTOP_RGU_WF_SUBSYS_RST_WF_WHOLE_PATH;
-	mt792xu_uhw_wr(&dev->mt76, MT_CBTOP_RGU_WF_SUBSYS_RST, val);
+	mt792xu_uhw_wr(&dev->mt76, desc->rst_reg, val);
 
-	mt792xu_uhw_wr(&dev->mt76, MT_UDMA_CONN_INFRA_STATUS_SEL, 0);
+	if (desc->need_status_sel)
+		mt792xu_uhw_wr(&dev->mt76, MT_UDMA_CONN_INFRA_STATUS_SEL, 0);
+
 	for (i = 0; i < MT792x_WFSYS_INIT_RETRY_COUNT; i++) {
-		val = mt792xu_uhw_rr(&dev->mt76, MT_UDMA_CONN_INFRA_STATUS);
-		if (val & MT_UDMA_CONN_WFSYS_INIT_DONE)
+		val = mt792xu_uhw_rr(&dev->mt76, desc->done_reg);
+		if ((val & desc->done_mask) == desc->done_val)
 			break;
 
 		msleep(100);
@@ -287,10 +460,20 @@ int mt792xu_init_reset(struct mt792x_dev *dev)
 }
 EXPORT_SYMBOL_GPL(mt792xu_init_reset);
 
+void mt792xu_stop(struct ieee80211_hw *hw, bool suspend)
+{
+	struct mt792x_dev *dev = mt792x_hw_dev(hw);
+
+	mt76u_stop_tx(&dev->mt76);
+	mt792x_stop(hw, false);
+}
+EXPORT_SYMBOL_GPL(mt792xu_stop);
+
 void mt792xu_disconnect(struct usb_interface *usb_intf)
 {
 	struct mt792x_dev *dev = usb_get_intfdata(usb_intf);
 
+	mt792xu_reset_work_cleanup(dev);
 	cancel_work_sync(&dev->init_work);
 	if (!test_bit(MT76_STATE_INITIALIZED, &dev->mphy.state))
 		return;
@@ -299,11 +482,11 @@ void mt792xu_disconnect(struct usb_interface *usb_intf)
 	mt792xu_cleanup(dev);
 
 	usb_set_intfdata(usb_intf, NULL);
-	usb_put_dev(interface_to_usbdev(usb_intf));
 
 	mt76_free_device(&dev->mt76);
 }
 EXPORT_SYMBOL_GPL(mt792xu_disconnect);
 
+MODULE_DESCRIPTION("MediaTek MT792x USB helpers");
 MODULE_LICENSE("Dual BSD/GPL");
 MODULE_AUTHOR("Lorenzo Bianconi <lorenzo@kernel.org>");

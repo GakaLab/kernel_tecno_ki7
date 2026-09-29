@@ -90,7 +90,6 @@ struct vfio_group {
 	struct mutex			group_lock;
 	struct kvm			*kvm;
 	struct file			*opened_file;
-	struct blocking_notifier_head	notifier;
 	struct iommufd_ctx		*iommufd;
 	spinlock_t			kvm_ref_lock;
 	unsigned int			cdev_device_open_cnt;
@@ -378,7 +377,7 @@ int vfio_device_fops_cdev_open(struct inode *inode, struct file *filep);
 long vfio_df_ioctl_bind_iommufd(struct vfio_device_file *df,
 				struct vfio_device_bind_iommufd __user *arg);
 void vfio_df_unbind_iommufd(struct vfio_device_file *df);
-int vfio_cdev_init(struct class *device_class);
+int vfio_cdev_init(void);
 void vfio_cdev_cleanup(void);
 #else
 static inline void vfio_init_device_cdev(struct vfio_device *device)
@@ -411,7 +410,7 @@ static inline void vfio_df_unbind_iommufd(struct vfio_device_file *df)
 {
 }
 
-static inline int vfio_cdev_init(struct class *device_class)
+static inline int vfio_cdev_init(void)
 {
 	return 0;
 }
@@ -434,7 +433,7 @@ static inline void vfio_virqfd_exit(void)
 }
 #endif
 
-#ifdef CONFIG_HAVE_KVM
+#if IS_ENABLED(CONFIG_KVM)
 void vfio_device_get_kvm_safe(struct vfio_device *device, struct kvm *kvm);
 void vfio_device_put_kvm(struct vfio_device *device);
 #else
@@ -447,5 +446,19 @@ static inline void vfio_device_put_kvm(struct vfio_device *device)
 {
 }
 #endif
+
+#ifdef CONFIG_VFIO_DEBUGFS
+void vfio_debugfs_create_root(void);
+void vfio_debugfs_remove_root(void);
+
+void vfio_device_debugfs_init(struct vfio_device *vdev);
+void vfio_device_debugfs_exit(struct vfio_device *vdev);
+#else
+static inline void vfio_debugfs_create_root(void) { }
+static inline void vfio_debugfs_remove_root(void) { }
+
+static inline void vfio_device_debugfs_init(struct vfio_device *vdev) { }
+static inline void vfio_device_debugfs_exit(struct vfio_device *vdev) { }
+#endif /* CONFIG_VFIO_DEBUGFS */
 
 #endif

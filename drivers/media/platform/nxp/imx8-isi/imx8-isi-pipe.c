@@ -263,10 +263,10 @@ int mxc_isi_pipe_enable(struct mxc_isi_pipe *pipe)
 	/* Configure the pipeline. */
 	state = v4l2_subdev_lock_and_get_active_state(sd);
 
-	sink_fmt = v4l2_subdev_get_try_format(sd, state, MXC_ISI_PIPE_PAD_SINK);
-	src_fmt = v4l2_subdev_get_try_format(sd, state, MXC_ISI_PIPE_PAD_SOURCE);
-	compose = v4l2_subdev_get_try_compose(sd, state, MXC_ISI_PIPE_PAD_SINK);
-	crop = *v4l2_subdev_get_try_crop(sd, state, MXC_ISI_PIPE_PAD_SOURCE);
+	sink_fmt = v4l2_subdev_state_get_format(state, MXC_ISI_PIPE_PAD_SINK);
+	src_fmt = v4l2_subdev_state_get_format(state, MXC_ISI_PIPE_PAD_SOURCE);
+	compose = v4l2_subdev_state_get_compose(state, MXC_ISI_PIPE_PAD_SINK);
+	crop = *v4l2_subdev_state_get_crop(state, MXC_ISI_PIPE_PAD_SOURCE);
 
 	sink_info = mxc_isi_bus_format_by_code(sink_fmt->code,
 					       MXC_ISI_PIPE_PAD_SINK);
@@ -322,7 +322,7 @@ mxc_isi_pipe_get_pad_format(struct mxc_isi_pipe *pipe,
 			    struct v4l2_subdev_state *state,
 			    unsigned int pad)
 {
-	return v4l2_subdev_get_try_format(&pipe->sd, state, pad);
+	return v4l2_subdev_state_get_format(state, pad);
 }
 
 static struct v4l2_rect *
@@ -330,7 +330,7 @@ mxc_isi_pipe_get_pad_crop(struct mxc_isi_pipe *pipe,
 			  struct v4l2_subdev_state *state,
 			  unsigned int pad)
 {
-	return v4l2_subdev_get_try_crop(&pipe->sd, state, pad);
+	return v4l2_subdev_state_get_crop(state, pad);
 }
 
 static struct v4l2_rect *
@@ -338,11 +338,11 @@ mxc_isi_pipe_get_pad_compose(struct mxc_isi_pipe *pipe,
 			     struct v4l2_subdev_state *state,
 			     unsigned int pad)
 {
-	return v4l2_subdev_get_try_compose(&pipe->sd, state, pad);
+	return v4l2_subdev_state_get_compose(state, pad);
 }
 
-static int mxc_isi_pipe_init_cfg(struct v4l2_subdev *sd,
-				 struct v4l2_subdev_state *state)
+static int mxc_isi_pipe_init_state(struct v4l2_subdev *sd,
+				   struct v4l2_subdev_state *state)
 {
 	struct mxc_isi_pipe *pipe = to_isi_pipe(sd);
 	struct v4l2_mbus_framefmt *fmt_source;
@@ -641,16 +641,19 @@ static int mxc_isi_pipe_set_selection(struct v4l2_subdev *sd,
 			/* Composing is supported on the sink only. */
 			return -EINVAL;
 
-		/* The sink crop is bound by the sink format downscaling only). */
+		/*
+		 * The ISI supports downscaling only, with a factor up to 16.
+		 * Clamp the compose rectangle size accordingly.
+		 */
 		format = mxc_isi_pipe_get_pad_format(pipe, state,
 						     MXC_ISI_PIPE_PAD_SINK);
 
 		sel->r.left = 0;
 		sel->r.top = 0;
-		sel->r.width = clamp(sel->r.width, MXC_ISI_MIN_WIDTH,
-				     format->width);
-		sel->r.height = clamp(sel->r.height, MXC_ISI_MIN_HEIGHT,
-				      format->height);
+		sel->r.width = mxc_isi_clamp_downscale_16(sel->r.width,
+							  format->width);
+		sel->r.height = mxc_isi_clamp_downscale_16(sel->r.height,
+							   format->height);
 
 		rect = mxc_isi_pipe_get_pad_compose(pipe, state,
 						    MXC_ISI_PIPE_PAD_SINK);
@@ -682,7 +685,6 @@ static int mxc_isi_pipe_set_selection(struct v4l2_subdev *sd,
 }
 
 static const struct v4l2_subdev_pad_ops mxc_isi_pipe_subdev_pad_ops = {
-	.init_cfg = mxc_isi_pipe_init_cfg,
 	.enum_mbus_code = mxc_isi_pipe_enum_mbus_code,
 	.get_fmt = v4l2_subdev_get_fmt,
 	.set_fmt = mxc_isi_pipe_set_fmt,
@@ -692,6 +694,10 @@ static const struct v4l2_subdev_pad_ops mxc_isi_pipe_subdev_pad_ops = {
 
 static const struct v4l2_subdev_ops mxc_isi_pipe_subdev_ops = {
 	.pad = &mxc_isi_pipe_subdev_pad_ops,
+};
+
+static const struct v4l2_subdev_internal_ops mxc_isi_pipe_internal_ops = {
+	.init_state = mxc_isi_pipe_init_state,
 };
 
 /* -----------------------------------------------------------------------------
@@ -767,6 +773,7 @@ int mxc_isi_pipe_init(struct mxc_isi_dev *isi, unsigned int id)
 
 	sd = &pipe->sd;
 	v4l2_subdev_init(sd, &mxc_isi_pipe_subdev_ops);
+	sd->internal_ops = &mxc_isi_pipe_internal_ops;
 	sd->flags |= V4L2_SUBDEV_FL_HAS_DEVNODE;
 	snprintf(sd->name, sizeof(sd->name), "mxc_isi.%d", pipe->id);
 	sd->dev = isi->dev;
@@ -792,18 +799,20 @@ int mxc_isi_pipe_init(struct mxc_isi_dev *isi, unsigned int id)
 	irq = platform_get_irq(to_platform_device(isi->dev), id);
 	if (irq < 0) {
 		ret = irq;
-		goto error;
+		goto error_subdev;
 	}
 
 	ret = devm_request_irq(isi->dev, irq, mxc_isi_pipe_irq_handler,
 			       0, dev_name(isi->dev), pipe);
 	if (ret < 0) {
 		dev_err(isi->dev, "failed to request IRQ (%d)\n", ret);
-		goto error;
+		goto error_subdev;
 	}
 
 	return 0;
 
+error_subdev:
+	v4l2_subdev_cleanup(sd);
 error:
 	media_entity_cleanup(&sd->entity);
 	mutex_destroy(&pipe->lock);
@@ -815,6 +824,7 @@ void mxc_isi_pipe_cleanup(struct mxc_isi_pipe *pipe)
 {
 	struct v4l2_subdev *sd = &pipe->sd;
 
+	v4l2_subdev_cleanup(sd);
 	media_entity_cleanup(&sd->entity);
 	mutex_destroy(&pipe->lock);
 }
@@ -832,8 +842,8 @@ int mxc_isi_pipe_acquire(struct mxc_isi_pipe *pipe,
 	int ret;
 
 	state = v4l2_subdev_lock_and_get_active_state(sd);
-	sink_fmt = v4l2_subdev_get_try_format(sd, state, MXC_ISI_PIPE_PAD_SINK);
-	src_fmt = v4l2_subdev_get_try_format(sd, state, MXC_ISI_PIPE_PAD_SOURCE);
+	sink_fmt = v4l2_subdev_state_get_format(state, MXC_ISI_PIPE_PAD_SINK);
+	src_fmt = v4l2_subdev_state_get_format(state, MXC_ISI_PIPE_PAD_SOURCE);
 	v4l2_subdev_unlock_state(state);
 
 	sink_info = mxc_isi_bus_format_by_code(sink_fmt->code,
@@ -851,7 +861,7 @@ int mxc_isi_pipe_acquire(struct mxc_isi_pipe *pipe,
 
 	/* Chain the channel if needed for wide resolutions. */
 	if (sink_fmt->width > MXC_ISI_MAX_WIDTH_UNCHAINED) {
-		ret = mxc_isi_channel_chain(pipe, bypass);
+		ret = mxc_isi_channel_chain(pipe);
 		if (ret)
 			mxc_isi_channel_release(pipe);
 	}
